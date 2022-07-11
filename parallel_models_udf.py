@@ -11,6 +11,7 @@ from collections import OrderedDict
 import datetime
 from pickle import dump
 from typing import List, Callable
+import csv
 
 from xgboost import XGBClassifier
 import pandas as pd
@@ -35,10 +36,12 @@ from hyperopt.early_stop import no_progress_loss
 import mlflow
 from mlflow.tracking import MlflowClient
 
+mlflow.autolog(disable=True)
+
 # COMMAND ----------
 
 # MAGIC %md ## Environment setup
-# MAGIC We want to fit each model in parrallel using separate Spark tasks. When working with smaller groups of data, Adaptive Query Execution (AQE) can combine these smaller model fitting tasks into a single, larger task where models are fit sequentially. Since we want to avoid this behavior, we will disable Adaptive Query Execution for this specialized use case. Generally, AQE should be left enabled.
+# MAGIC We want to fit each model in parrallel using separate Spark tasks. When working with smaller groups of data, Adaptive Query Execution (AQE) can combine these smaller model fitting tasks into a single, larger task where models are fit sequentially. Since we want to avoid this behavior in this example, we will disable Adaptive Query Execution. Generally, AQE should be left enabled.
 
 # COMMAND ----------
 
@@ -185,8 +188,13 @@ def create_preprocessing_transform(categorical_features: List[str], numerical_fe
 
 def configure_model_udf(label_col: str, grouping_col:str, pipeline:ColumnTransformer, test_size:float=0.33, 
                         xgb_early_stopping_rounds:int=25, eval_metric:str="auc", random_state:int=123) -> Callable[[pd.DataFrame], pd.DataFrame]:
+  
+  """
+  Configure a PandasUDF function and that trains and XGBoost model on a group of data. The UDF is applied
+  using the groupBy.applyInPandas method.
+  """
     
-  def train_model_udf(group_training_data: pd.DataFrame) -> pd.DataFrame:
+  def train_model_udf(group_training_data):
     
     # Measure the training time of each model
     start = datetime.datetime.now()
@@ -222,6 +230,8 @@ def configure_model_udf(label_col: str, grouping_col:str, pipeline:ColumnTransfo
     
     # Capture statistics on the best model run
     best_score = model_pipeline.named_steps['model'].best_score
+    
+    # The best performing number of XGBoost trees
     best_iteration = model_pipeline.named_steps['model'].best_iteration
     
     # Predict using only the boosters leading up to and including the best boosting 
@@ -266,7 +276,7 @@ def configure_model_udf(label_col: str, grouping_col:str, pipeline:ColumnTransfo
 # COMMAND ----------
 
 # MAGIC %md ### Apply the PandasUDF  
-# MAGIC PandasUDFs return Pandas DataFrames; we need to specify a Spark DataFrame schema that maps to the column names and data types returned by the UDF. 
+# MAGIC The PandasUDF returns a Pandas DataFrame; we must specify a Spark DataFrame schema that maps to the column names and Python data types returned by the UDF. 
 
 # COMMAND ----------
 
@@ -298,6 +308,11 @@ grouping_col =         'group_name'
 
 # COMMAND ----------
 
+# MAGIC %md ### View models' output
+# MAGIC We will now apply our PandasUDF to a Spark Dataframe, returning a new Spark Dataframe. Our returned DataFrame contains one row per group in our data. We can see that models were fit seprately for each group on different, independent Spark tasks and these tasks were all executed at the same time, and therefore, in the same stage. We also retrieved several performance statistics for each model.
+
+# COMMAND ----------
+
 # Create a pre-processing pipeline instance
 pipeline = create_preprocessing_transform(categorical_features, numerical_features)
 
@@ -308,13 +323,7 @@ train_model_udf = configure_model_udf(label_col,
 
 best_model_stats = features.groupBy('group_name').applyInPandas(train_model_udf, schema=spark_schema)
 
-# COMMAND ----------
-
-# MAGIC %md ### View models' output
-# MAGIC We will now apply our PandasUDF to a Spark Dataframe, returning a new Spark Dataframe. Our returned DataFrame contains one row per group in our data. We can see that models were fit seprately for each group on different, independent Spark tasks and these tasks were all executed at the same time, and therefore, in the same stage. We also retrieved several performance statistics for each model.
-
-# COMMAND ----------
-
+spark.sql("DROP TABLE IF EXISTS default.best_model_stats")
 best_model_stats.write.mode('overwrite').format('delta').saveAsTable('default.best_model_stats')
 display(spark.table('default.best_model_stats'))
 
@@ -323,7 +332,7 @@ display(spark.table('default.best_model_stats'))
 # MAGIC %md ## Tuning our models using Hyperopt
 # MAGIC Now that we can fit models in parallel on different groups of data, we shift toward model tuning. Compared to arbitrarily choosing different model parameters to test, the Hyperopt optimization library, which is built into the Databricks Machine Learning runtime,  provides a more robust mechanism for intelligently searching a broader hyperparameter space, potentially leading to better models.
 # MAGIC 
-# MAGIC We can incorporate a hyper-parameter search using Hyperopt into our Pandas UDF. Let's first fit an simple example on the full dataset for illustration purposes.
+# MAGIC We can incorporate a hyper-parameter search using Hyperopt into our Pandas UDF. Let's first fit a simple example on a single group for illustration purposes.
 
 # COMMAND ----------
 
@@ -337,7 +346,7 @@ display(spark.table('default.best_model_stats'))
 # COMMAND ----------
 
 parameter_search_space = {'n_estimators':     1000,
-                          'max_depth':        hp.quniform('max_depth', 6, 18, 1),
+                          'max_depth':        hp.quniform('max_depth', 3, 18, 1),
                           'lambda':           hp.uniform('lambda', 1, 10),
                           'subsample':        hp.uniform('subsample', 0.5, 1.0),
                           'colsample_bytree': hp.uniform('colsample_bytree', 0.5, 1.0),
@@ -354,8 +363,11 @@ parameter_search_space = {'n_estimators':     1000,
 
 # COMMAND ----------
 
-def configure_object_fn(x_train_transformed, y_train, x_test_transformed, y_test, xgb_early_stopping_rounds=25, eval_metric="auc"):
-
+def configure_object_fn(x_train_transformed, y_train, x_test_transformed, y_test, xgb_early_stopping_rounds=25, 
+                        eval_metric="auc") -> Callable[[dict], dict]:
+  """
+  Configure a Hyperopt objective function
+  """
 
   def hyperopt_objective_fn(params):
 
@@ -428,7 +440,7 @@ trials = Trials()
 best_params = fmin(fn=objective_fn, 
                    space=parameter_search_space, 
                    algo=tpe.suggest,
-                   max_evals=10,
+                   max_evals=25,
                    trials=trials, 
                    rstate=np.random.default_rng(50))
 
@@ -486,6 +498,10 @@ model_pipeline.fit(features_df, features_df['label'])
 
 # COMMAND ----------
 
+final_model_parameters
+
+# COMMAND ----------
+
 # MAGIC %md ### Performing inference  
 # MAGIC Notice we are able to call our fitted model Pipeline on raw input data. Our Pipeline handles both feature transformations/encoding and prediction.
 
@@ -504,8 +520,12 @@ predictions.head()
 # COMMAND ----------
 
 def configure_model_hyperopt_udf(label_col:str, grouping_col:str, pipeline:ColumnTransformer, parameter_search_space, 
-                                 xgb_early_stopping_rounds:str=25, max_hyperopt_evals:int=50, eval_metric:str="auc", 
+                                 xgb_early_stopping_rounds:str=25, max_hyperopt_evals:int=25, eval_metric:str="auc", 
                                  test_size:float=0.33, random_state:int=123) -> Callable[[pd.DataFrame], pd.DataFrame]:
+  
+  """
+  Configure a PandasUDF that train models using Hyperopt for hyperparameter tuning
+  """
     
     
   def train_model_hyperopt_udf(group_training_data):
@@ -652,12 +672,11 @@ get_or_create_experiment(experiment_location)
 
 # COMMAND ----------
 
-# MAGIC %md ### Working with nested experiments  
-# MAGIC Because each model training run can fit many models, we will use nested MLflow tracking server runs. The parent run will contain information about the model run as well as model artifacts. Child runs will contain model-specific information, such as the validation statistics for each run. See the below example that demonstrates a simple, nested runs workflow.
-
-# COMMAND ----------
-
-def get_new_run(experiment_location, run_name):
+def get_new_run(experiment_location: str, run_name: str) -> str:
+  """
+  Given an MLflow experiment location and a run name, create an 
+  MLflow experiment run to which artifacts can be logged.
+  """
   
   mlflow.set_experiment(experiment_location)
   run = mlflow.start_run(run_name=run_name)
@@ -665,23 +684,6 @@ def get_new_run(experiment_location, run_name):
   mlflow.end_run()
   
   return run_id
-
-# COMMAND ----------
-
-parent_run_id = get_new_run(experiment_location, "parent_run")
-print(parent_run_id)
-
-# COMMAND ----------
-
-# MAGIC %md Navigate to the MLflow Tracking Server instance to see the nested experiment created below.
-
-# COMMAND ----------
-
-with mlflow.start_run(run_id=parent_run_id) as parent_run:
-  mlflow.log_param('run_level', 'parent')
-  
-  with mlflow.start_run(run_name="child_run", nested=True) as child_run:
-    mlflow.log_param('run_level', 'child')
 
 # COMMAND ----------
 
@@ -728,25 +730,36 @@ display(my_predictions)
 # COMMAND ----------
 
 # MAGIC %md ### Creating a custom MLflow models to load each group's model
-# MAGIC As we fit models on separate groups of data using our PandasUDF, we will log each fitted model to the parent run in MLflow as an artifact. We will also create a "meta" model that given a group of data, will load the group's trained model from MLflow.
+# MAGIC As we fit models on separate groups of data using our PandasUDF, we will log each fitted model to the same run in MLflow as an artifact. We will also create a "meta" model that given a group of data, will load the group's trained model from MLflow.
 
 # COMMAND ----------
 
 class GroupInferenceModel(mlflow.pyfunc.PythonModel):
+  """
+  A custom MLflow model designed to accept a group of data, 
+  import that group's trained model from MLflow, and return 
+  predictions for the group.
+  
+  Attributes:
+    run_id: The MLflow run id to which all models will be logged
+    group_name_col: The column name containing the grouping variable
+    id_cols: The id columns that should be returned along with the 
+             predictions
+  """
 
-  def __init__(self, parent_run_id:str, group_name_col:str, id_cols:List[str]):
+  def __init__(self, run_id:str, group_name_col:str, id_cols:List[str]):
     super().__init__()
-    self.parent_run_id = parent_run_id
+    self.run_id = run_id
     self.group_name_col = group_name_col    
     self.id_cols = id_cols
     
-  def predict(self, context, model_input):
+  def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
     
     # Determine the group of the data
     group_name = model_input[self.group_name_col].loc[0]
     
     # Load the group's trained model from MLflow
-    model_artifact_location = f'runs:/{self.parent_run_id}/models/{group_name}'
+    model_artifact_location = f'runs:/{self.run_id}/models/{group_name}'
     
     model = mlflow.sklearn.load_model(model_artifact_location)
     
@@ -759,22 +772,36 @@ class GroupInferenceModel(mlflow.pyfunc.PythonModel):
 
 # COMMAND ----------
 
-# MAGIC %md ### Adding the custom MLflow model to our PandasUDF
+# MAGIC %md ### Adding the custom MLflow model to our PandasUDF and Logging to MLflow  
+# MAGIC 
+# MAGIC Model metrics and parameters are stored in csv files within each group's model artifact directory.
+# MAGIC 
+# MAGIC In addition, we leverage Hyperopt's early stopping functionality. Similar to early stopping for XGBoost, we can end our Hyperopt training runs if performance does not improve. Since we want to find our best models efficiently and are now working with larger datasets, we will instruct Hyperopt to stop testing hyper-parameters if our loss functions does not decrease after 25 trials.
+# MAGIC 
+# MAGIC We set the **early_stop_fn** to **no_progress_loss**, which specifies the theshold beyond which the loss for a trial must improve. We will specify that the model loss must inprove by one half of a percentage point after 25 trials or else model training will stop. Details of the early stopping function [is available here](https://github.com/hyperopt/hyperopt/blob/master/hyperopt/early_stop.py), which is referenced in the [databricks documentation](https://docs.databricks.com/applications/machine-learning/automl-hyperparam-tuning/hyperopt-concepts.html#fmin).
 
 # COMMAND ----------
 
 def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols:List[str], pipeline:ColumnTransformer, parameter_search_space, 
-                                        experiment_location:str, parent_run_id:str, xgb_early_stopping_rounds:str=25, max_hyperopt_evals:int=50,
-                                        eval_metric:str="auc", test_size:float=0.33, random_state:int=123) -> Callable[[pd.DataFrame], pd.DataFrame]:
+                                        experiment_location:str, run_id:str, xgb_early_stopping_rounds:str=25, max_hyperopt_evals:int=200,
+                                        hyperopt_early_stopping_rounds:str=25, hyperopt_early_stopping_threshold:float=0.5, eval_metric:str="auc",
+                                        test_size:float=0.33, random_state:int=123) -> Callable[[pd.DataFrame], pd.DataFrame]:
+  
   
   # Log the meta model to the parent run
-  with mlflow.start_run(run_id = parent_run_id) as parent_run:
+  with mlflow.start_run(run_id = run_id) as run:
 
-      meta_model = GroupInferenceModel(parent_run_id, grouping_col, id_cols)  
+      meta_model = GroupInferenceModel(run_id, grouping_col, id_cols)  
       mlflow.pyfunc.log_model("meta_model", python_model=meta_model)
     
     
-  def train_model_hyperopt_mlflow_udf(group_training_data):
+  def train_model_hyperopt_mlflow_udf(group_training_data: pd.DataFrame) -> pd.DataFrame:
+    """
+    A PandasUDF that give a group of data will train an XGBoost model. Hyperparameter tuning
+    is performed using Hyperopt. The best model parameters found by Hyperopt is used to train
+    a final model. The model is logged to MLflow. Model fit statistics and parameters are logged
+    as .csv files in the model artifact directory in MLflow
+    """
     
     start = datetime.datetime.now()
     
@@ -793,7 +820,7 @@ def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols
     
     def hyperopt_objective_fn(params):
       
-      # Some model parameters require integeger values; change the time in these cases
+      # Some model parameters require integeger values; change the type in these cases
       params['max_depth'] =        int(params['max_depth'])
       
       model = XGBClassifier(**params)
@@ -814,6 +841,7 @@ def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols
       precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, train_pred, average='weighted')
       precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, test_pred, average='weighted')
 
+      # Capture and return fit statistcs from the Hyperopt Trial
       digits = 3
       metrics = OrderedDict()
       metrics["train_precision"]= round(precision_train, digits)
@@ -822,7 +850,7 @@ def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols
       metrics["test_precision"] = round(precision_test, digits)
       metrics["test_recall"] =    round(recall_test, digits)
       metrics["test_f1"] =        round(f1_test, digits)
-      metrics["test_auc"] =     round(best_score, digits)
+      metrics["test_auc"] =       round(best_score, digits)
       metrics["best_iteration"] = round(best_iteration, digits)
     
       return {'status': STATUS_OK, 'loss': 1- best_score, 'metrics': metrics}
@@ -835,10 +863,9 @@ def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols
                        algo=tpe.suggest,
                        max_evals=max_hyperopt_evals, 
                        trials=trials, 
-                       rstate=np.random.default_rng(50))
+                       rstate=np.random.default_rng(50),
+                       early_stop_fn=no_progress_loss(iteration_stop_count=hyperopt_early_stopping_rounds, percent_increase=hyperopt_early_stopping_threshold))
         
-
-    # Fit final model with best parameters on full dataset
     final_model_parameters = {}
     final_model_parameters['n_estimators'] = int(trials.best_trial['result']['metrics']['best_iteration'])
 
@@ -860,30 +887,55 @@ def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols
     seconds = round(elapsed.total_seconds(), 1)
     
     mlflow.set_experiment(experiment_location)
-    with mlflow.start_run(run_id = parent_run_id) as parent_run:
+    with mlflow.start_run(run_id = run_id) as run:
       
-      # Log group-level models
-      mlflow.sklearn.log_model(final_pipeline, artifact_path=f'models/{group_name}')
+      # Log group model
+      artifact_path =f'models/{group_name}'
+      mlflow.sklearn.log_model(final_pipeline, artifact_path=artifact_path)
       
-      # Log group-level metrics
-      with mlflow.start_run(run_name = group_name, nested=True) as child_run:
+      # Log group parameters as csv
+      parameters_column_names = ['parameter', 'value']
+      parameters_csv_formatted = [{"parameter": parameter, "value": value} 
+                                    for parameter, value in final_model_parameters.items()]
+      
+      parameters_file_name = '/parameters.csv'
+      with open(parameters_file_name, 'w') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=parameters_column_names)
+        writer.writeheader()
+        writer.writerows(parameters_csv_formatted)
         
-        # Construct final output
-        output = OrderedDict()
-        output['group'] =           group_name
-        output['stage_id'] =        TaskContext().stageId()
-        output['task_attempt_id'] = task_attempt_id = TaskContext().taskAttemptId()
-        output['start_time'] =      start.strftime("%d-%b-%Y (%H:%M:%S.%f)")
-        output['end_time'] =        end.strftime("%d-%b-%Y (%H:%M:%S.%f)")
-        output['elapsed_seconds'] = seconds
-        output['best_trial_tid'] =  trials.best_trial['tid']
-  
-        best_model_metrics = trials.best_trial['result']['metrics']
-    
-        mlflow.log_metrics(best_model_metrics)
-        mlflow.log_params(output)
+      mlflow.log_artifact(parameters_file_name, artifact_path=artifact_path)
       
-        output.update(best_model_metrics)
+      # Log group metrics as csv
+      best_model_metrics = trials.best_trial['result']['metrics']
+      
+      metrics_column_names = ['metric', 'value']
+      metrics_csv_formatted = [{'metric': metric, "value": value} 
+                                    for metric, value in best_model_metrics.items()]
+      
+      metrics_file_name = f'/metrics.csv'
+      with open(metrics_file_name, 'w') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=metrics_column_names)
+        writer.writeheader()
+        writer.writerows(metrics_csv_formatted)
+        
+      mlflow.log_artifact(metrics_file_name, artifact_path=artifact_path)
+      
+
+      # Construct dataframe output
+      output = OrderedDict()
+      output['group'] =           group_name
+      output['mlflow_run_id'] =   run_id
+      output['stage_id'] =        TaskContext().stageId()
+      output['task_attempt_id'] = task_attempt_id = TaskContext().taskAttemptId()
+      output['start_time'] =      start.strftime("%d-%b-%Y (%H:%M:%S.%f)")
+      output['end_time'] =        end.strftime("%d-%b-%Y (%H:%M:%S.%f)")
+      output['elapsed_seconds'] = seconds
+      output['best_hyperopt_trial'] =  trials.best_trial['tid']
+
+      # Delete XGBoost best interation (number of trees) from the metrics dict
+      del best_model_metrics['best_iteration']
+      output.update(best_model_metrics)
     
     return pd.DataFrame(output, index=[0])
   
@@ -891,16 +943,37 @@ def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols
 
 # COMMAND ----------
 
-# MAGIC %md ### Fitting the models 
+# MAGIC %md ### Fitting the models and log to MLflow
 
 # COMMAND ----------
 
 id_cols = ['id']
 
+# Add additional columns to out Spark Schema
+spark_types = [('group',                StringType()),
+               ('mlflow_run_id',        StringType()),
+               ('stage_id',             IntegerType()),
+               ('task_attempt_id',      IntegerType()),
+               ('start_time',           StringType()),
+               ('end_time',             StringType()),
+               ('elapsed_seconds',      FloatType()),
+               ('train_precision',      FloatType()),
+               ('train_recall',         FloatType()),
+               ('train_f1',             FloatType()),
+               ('test_precision',       FloatType()),
+               ('test_recall',          FloatType()),
+               ('test_f1',              FloatType()),
+               ('test_auc',             FloatType()),
+               ('best_hyperopt_trial',  IntegerType())]
+
+spark_schema = StructType()
+for col_name, spark_type in spark_types:
+  spark_schema.add(col_name, spark_type)
+
 pipeline = create_preprocessing_transform(categorical_features, numerical_features)
 
 # Create MLflow parent run
-parent_run_id = get_new_run(experiment_location, "parent_run")
+run_id = get_new_run(experiment_location, "group_model_run")
 
 # Configure Pandas UDF            
 train_model_hyperopt_mlflow_udf = configure_model_hyperopt_mlflow_udf(label_col, 
@@ -909,7 +982,7 @@ train_model_hyperopt_mlflow_udf = configure_model_hyperopt_mlflow_udf(label_col,
                                                                       pipeline,
                                                                       parameter_search_space,
                                                                       experiment_location,
-                                                                      parent_run_id)
+                                                                      run_id)
 
 # Fit models by applying UDF  
 best_model_stats = features.groupBy('group_name').applyInPandas(train_model_hyperopt_mlflow_udf, schema=spark_schema)
@@ -920,7 +993,7 @@ display(spark.table('default.best_model_stats'))
 
 # COMMAND ----------
 
-# MAGIC %md ### Promoting the run to the Model Registry
+# MAGIC %md ### Promoting the run to the Model Registry  
 
 # COMMAND ----------
 
@@ -949,14 +1022,14 @@ except:
 
 # COMMAND ----------
 
-model_info = client.get_run(parent_run_id).to_dictionary()
+model_info = client.get_run(run_id).to_dictionary()
 artifact_uri = model_info['info']['artifact_uri']
 
 
 registered_model = client.create_model_version(
                      name = model_registry_name,
                      source = artifact_uri + "/meta_model",
-                     run_id = parent_run_id
+                     run_id = run_id
                     )
 
 # COMMAND ----------
@@ -981,7 +1054,11 @@ promote_to_prod = client.transition_model_version_stage(name=model_registry_name
 
 # COMMAND ----------
 
-def get_model_info(model_name:str, stage:str):
+def get_model_info(model_name:str, stage:str) -> str:
+  """
+  Given a the name of a registered model and a Model Registry stage,
+  return the model's unique run id
+  """
   
   from mlflow.tracking import MlflowClient
   
@@ -998,7 +1075,11 @@ def get_model_info(model_name:str, stage:str):
 
 # COMMAND ----------
 
-def inference_model_config(model_name:str, registry_stage:str='Production'):
+def inference_model_config(model_name:str, registry_stage:str='Production') -> Callable[[pd.DataFrame], pd.DataFrame]:
+  """
+  Load a model from the Model Registry and return a PandasUDF function. The PandasUDF will apply 
+  the models to different groups of data via the groupBy.applyInPandas method.
+  """
   
   model_artifact_location = get_model_info(model_name, registry_stage)
   
@@ -1014,7 +1095,7 @@ def inference_model_config(model_name:str, registry_stage:str='Production'):
 
 # COMMAND ----------
 
-# MAGIC %md Specify the Spark Dataframe schema that maps to the UDF's output
+# MAGIC %md Specify the Spark Dataframe schema that maps to the UDF's output. Apply the inference UDF to generate predictions.
 
 # COMMAND ----------
 
@@ -1028,176 +1109,3 @@ inference_model = inference_model_config(model_name = model_registry_name)
 predictions = features.groupBy('group_name').applyInPandas(inference_model, schema=prediction_schema)
 
 display(predictions)
-
-# COMMAND ----------
-
-# MAGIC %md ## Adding early stopping for Hyperopt
-# MAGIC Similar to early stopping for XGBoost, we can end our Hyperopt training runs if performance does not improve. Since we want to find our best models efficiently and are now working with larger datasets, we will instruct Hyperopt to stop testing hyper-parameters if our loss functions does not decrease after 50 trials.
-# MAGIC 
-# MAGIC We set the **early_stop_fn** to **no_progress_loss**, which specifies the theshold beyond which the loss for a trial must improve. We will specify that the model loss must inprove by one half of a percentage point after 50 trials or else model training will stop. Details of the early stopping function [is available here](https://github.com/hyperopt/hyperopt/blob/master/hyperopt/early_stop.py), which is referenced in the [databricks documentation](https://docs.databricks.com/applications/machine-learning/automl-hyperparam-tuning/hyperopt-concepts.html#fmin).
-
-# COMMAND ----------
-
-def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols:List[str], pipeline:ColumnTransformer, parameter_search_space, 
-                                        experiment_location:str, parent_run_id:str, xgb_early_stopping_rounds:str=25, max_hyperopt_evals:int=500, 
-                                        hyperopt_early_stopping_rounds:str=50, hyperopt_early_stopping_threshold:float=0.5, eval_metric:str="auc", 
-                                        test_size:float=0.33, random_state:int=123) -> Callable[[pd.DataFrame], pd.DataFrame]:
-  
-  # Log the meta model to the parent run
-  with mlflow.start_run(run_id = parent_run_id) as parent_run:
-    
-      meta_model = GroupInferenceModel(parent_run_id, 'group_name', ['id'])  
-      mlflow.pyfunc.log_model("meta_model", python_model=meta_model)
-    
-    
-  def train_model_hyperopt_mlflow_udf(group_training_data):
-    
-    start = datetime.datetime.now()
-    
-    group_name = group_training_data[grouping_col].loc[0]
-    
-    x_train, x_test, y_train, y_test = train_test_split(group_training_data, 
-                                                        group_training_data[label_col], 
-                                                        test_size=test_size, 
-                                                        random_state=random_state)
-    
-    # Transforming features outside of the iterative Hyperopt workflow
-    pipeline.fit(x_train)
-    x_train_transformed = pipeline.transform(x_train)
-    x_test_transformed = pipeline.transform(x_test)
-    
-    
-    def hyperopt_objective_fn(params):
-    
-      # Some model parameters require integeger values; change the time in these cases
-      params['max_depth'] =        int(params['max_depth'])
-      
-      model = XGBClassifier(**params)
-        
-      model.fit(x_train_transformed, y_train.values.ravel(),
-                eval_set = [(x_test_transformed, y_test.values.ravel())],
-                # See options here: https://github.com/dmlc/xgboost/blob/master/doc/parameter.rst
-                eval_metric=eval_metric,
-                early_stopping_rounds=xgb_early_stopping_rounds,
-                verbose=True)
-      
-      best_score = model.best_score
-      best_iteration = model.best_iteration
-      
-      train_pred = model.predict(x_train_transformed, iteration_range = (0, best_iteration + 1))
-      test_pred = model.predict(x_test_transformed, iteration_range = (0, best_iteration + 1))
-    
-      precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, train_pred, average='weighted')
-      precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, test_pred, average='weighted')
-      
-      digits = 3
-      metrics = OrderedDict()
-      metrics["train_precision"]= round(precision_train, digits)
-      metrics["train_recall"] =   round(recall_train, digits)
-      metrics["train_f1"] =       round(f1_train, digits)
-      metrics["test_precision"] = round(precision_test, digits)
-      metrics["test_recall"] =    round(recall_test, digits)
-      metrics["test_f1"] =        round(f1_test, digits)
-      metrics["test_auc"] =     round(best_score, digits)
-      metrics["best_iteration"] = round(best_iteration, digits)
-    
-      return {'status': STATUS_OK, 'loss': 1- best_score, 'metrics': metrics}
-    
-  
-    trials = Trials()
-
-    best_params = fmin(fn=hyperopt_objective_fn, 
-                       space=parameter_search_space, 
-                       algo=tpe.suggest,
-                       max_evals=max_hyperopt_evals, 
-                       trials=trials, 
-                       rstate=np.random.default_rng(50),
-                       early_stop_fn=no_progress_loss(iteration_stop_count=hyperopt_early_stopping_rounds, percent_increase=hyperopt_early_stopping_threshold))
-        
-
-    # Fit final model with best parameters on full dataset
-    final_model_parameters = {}
-    final_model_parameters['n_estimators'] = int(trials.best_trial['result']['metrics']['best_iteration'])
-
-    # Adjust parameter data types to meet xgboost requirements
-    for parameter, value in best_params.items():
-          if parameter in ['max_depth']:
-            final_model_parameters[parameter] = int(value)
-          else:
-            final_model_parameters[parameter] = value
-
-    # Fit the pipeline and model on full dataset
-    final_model = XGBClassifier(**final_model_parameters)
-    final_pipeline = Pipeline([("preprocess", pipeline), ("classifier", final_model)])
-
-    final_pipeline.fit(group_training_data, group_training_data[label_col])
-    
-    end = datetime.datetime.now()
-    elapsed = end-start
-    seconds = round(elapsed.total_seconds(), 1)
-    
-    mlflow.set_experiment(experiment_location)
-    with mlflow.start_run(run_id = parent_run_id) as parent_run:
-      
-      # Log group-level models
-      mlflow.sklearn.log_model(final_pipeline, artifact_path=f'models/{group_name}')
-      
-      with mlflow.start_run(run_name = group_name, nested=True) as child_run:
-        
-        # Construct final output
-        output = OrderedDict()
-        output['group'] =           group_name
-        output['stage_id'] =        TaskContext().stageId()
-        output['task_attempt_id'] = task_attempt_id = TaskContext().taskAttemptId()
-        output['start_time'] =      start.strftime("%d-%b-%Y (%H:%M:%S.%f)")
-        output['end_time'] =        end.strftime("%d-%b-%Y (%H:%M:%S.%f)")
-        output['elapsed_seconds'] = seconds
-        output['best_trial_tid'] =  trials.best_trial['tid']
-  
-        best_model_metrics = trials.best_trial['result']['metrics']
-    
-        mlflow.log_metrics(best_model_metrics)
-        mlflow.log_params(output)
-      
-        output.update(best_model_metrics)
-    
-    return pd.DataFrame(output, index=[0])
-  
-  return train_model_hyperopt_mlflow_udf
-
-# COMMAND ----------
-
-# MAGIC %md Execute the final PandasUDF
-
-# COMMAND ----------
-
-# Create a new pipeline
-pipeline = create_preprocessing_transform(categorical_features, numerical_features)
-
-# Set experiment location and create new parent run
-def get_new_run(experiment_location, run_name):
-  
-  mlflow.set_experiment(experiment_location)
-  run = mlflow.start_run(run_name=run_name)
-  run_id = run.to_dictionary()['info']['run_id']
-  mlflow.end_run()
-  
-  return run_id
-
-
-parent_run_id = get_new_run(experiment_location, "parent_run")
-
-# Configure Pandas UDF            
-train_model_hyperopt_mlflow_udf = configure_model_hyperopt_mlflow_udf(label_col, 
-                                                                      grouping_col, 
-                                                                      id_cols,
-                                                                      pipeline,
-                                                                      parameter_search_space,
-                                                                      experiment_location,
-                                                                      parent_run_id)
-
-# Fit models by applying UDF  
-best_model_stats = features.groupBy('group_name').applyInPandas(train_model_hyperopt_mlflow_udf, schema=spark_schema)
-
-best_model_stats.write.mode('overwrite').format('delta').saveAsTable('default.best_model_stats')
-display(spark.table('default.best_model_stats'))
