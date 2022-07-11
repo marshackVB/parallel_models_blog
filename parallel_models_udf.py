@@ -209,39 +209,43 @@ def configure_model_udf(label_col: str, grouping_col:str, pipeline:ColumnTransfo
      
     # We must pass the testing dataset to the model to leverage early stopping,
     # and the training dataset must be transformed.
-    pipeline.fit(x_train)
+    x_train_transformed = pipeline.fit_transform(x_train)
     x_test_transformed = pipeline.transform(x_test)
     
     # Create a scikit-learning pipeline that transforms the features and applies the
     # model
     model = XGBClassifier(n_estimators=1000)
     
-    model_pipeline = Pipeline([('feature_preprocessing', pipeline),
-                               ('model', model)])
-    
     # Fit the model with early stopping
     # Note: Early stopping returns the model from the last iteration (not the best one). If there’s more 
     # than one item in eval_set, the last entry will be used for early stopping.
-    model_pipeline.fit(x_train, y_train.values.ravel(),
-                       model__eval_set = [(x_test_transformed, y_test.values.ravel())],
-                       model__eval_metric=eval_metric,
-                       model__early_stopping_rounds=xgb_early_stopping_rounds,
-                       model__verbose=True)
+    model.fit(x_train_transformed, y_train.values.ravel(),
+              eval_set = [(x_test_transformed, y_test.values.ravel())],
+              eval_metric=eval_metric,
+              early_stopping_rounds=xgb_early_stopping_rounds,
+              verbose=True)
     
     # Capture statistics on the best model run
-    best_score = model_pipeline.named_steps['model'].best_score
+    best_score = model.best_score
     
     # The best performing number of XGBoost trees
-    best_iteration = model_pipeline.named_steps['model'].best_iteration
+    best_iteration = model.best_iteration
+    best_xgboost_rounds = (0, best_iteration + 1)
     
     # Predict using only the boosters leading up to and including the best boosting 
     # round. This accounts for the fact that the model retained by xgboost is the last
     # model fit before early stopping rounds were triggered
-    train_pred = model_pipeline.predict(x_train, iteration_range = (0, best_iteration + 1))
-    test_pred = model_pipeline.predict(x_test, iteration_range = (0, best_iteration + 1))
+    precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, 
+                                                                                 model.predict(x_train_transformed, iteration_range=best_xgboost_rounds), 
+                                                                                 average='weighted')
     
-    precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, train_pred, average='weighted')
-    precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, test_pred, average='weighted')
+    precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, 
+                                                                              model.predict(x_test_transformed, iteration_range=best_xgboost_rounds), 
+                                                                              average='weighted')
+    
+    train_auc = roc_auc_score(y_train, 
+                              model.predict_proba(x_train_transformed, iteration_range=best_xgboost_rounds)[:,1],
+                              average="weighted")
     
     end = datetime.datetime.now()
     elapsed = end-start
@@ -253,6 +257,7 @@ def configure_model_udf(label_col: str, grouping_col:str, pipeline:ColumnTransfo
     metrics["train_precision"]= round(precision_train, digits)
     metrics["train_recall"] =   round(recall_train, digits)
     metrics["train_f1"] =       round(f1_train, digits)
+    metrics["train_auc"] =      round(train_auc, digits)
     metrics["test_precision"] = round(precision_test, digits)
     metrics["test_recall"] =    round(recall_test, digits)
     metrics["test_f1"] =        round(f1_test, digits)
@@ -290,6 +295,7 @@ spark_types = [('group',             StringType()),
                 ('train_precision',  FloatType()),
                 ('train_recall',     FloatType()),
                 ('train_f1',         FloatType()),
+                ('train_auc',        FloatType()),
                 ('test_precision',   FloatType()),
                 ('test_recall',      FloatType()),
                 ('test_f1',          FloatType()),
@@ -385,18 +391,26 @@ def configure_object_fn(x_train_transformed, y_train, x_test_transformed, y_test
 
     best_score = model.best_score
     best_iteration = model.best_iteration
+    best_xgboost_rounds = (0, best_iteration + 1)
     
-    train_pred = model.predict(x_train_transformed, iteration_range = (0, best_iteration + 1))
-    test_pred = model.predict(x_test_transformed, iteration_range = (0, best_iteration + 1))
-
-    precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, train_pred, average='weighted')
-    precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, test_pred, average='weighted')
+    precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, 
+                                                                                 model.predict(x_train_transformed, iteration_range=best_xgboost_rounds), 
+                                                                                 average='weighted')
+    
+    precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, 
+                                                                              model.predict(x_test_transformed, iteration_range=best_xgboost_rounds), 
+                                                                              average='weighted')
+    
+    train_auc = roc_auc_score(y_train, 
+                              model.predict_proba(x_train_transformed, iteration_range=best_xgboost_rounds)[:,1],
+                              average="weighted")
 
     digits = 3
     metrics = OrderedDict()
     metrics["train_precision"]= round(precision_train, digits)
     metrics["train_recall"] =   round(recall_train, digits)
     metrics["train_f1"] =       round(f1_train, digits)
+    metrics["train_auc"] =      round(train_auc, digits)
     metrics["test_precision"] = round(precision_test, digits)
     metrics["test_recall"] =    round(recall_test, digits)
     metrics["test_f1"] =        round(f1_test, digits)
@@ -422,8 +436,7 @@ x_train, x_test, y_train, y_test = train_test_split(features_df,
 
 pipeline = create_preprocessing_transform(categorical_features, numerical_features)
 
-pipeline.fit(x_train)
-x_train_transformed = pipeline.transform(x_train)
+x_train_transformed = pipeline.fit_transform(x_train)
 x_test_transformed = pipeline.transform(x_test)
 
 
@@ -540,8 +553,7 @@ def configure_model_hyperopt_udf(label_col:str, grouping_col:str, pipeline:Colum
                                                         random_state=random_state)
     
     # Transforming features outside of the iterative Hyperopt workflow
-    pipeline.fit(x_train)
-    x_train_transformed = pipeline.transform(x_train)
+    x_train_transformed = pipeline.fit_transform(x_train)
     x_test_transformed = pipeline.transform(x_test)
     
     
@@ -561,18 +573,25 @@ def configure_model_hyperopt_udf(label_col:str, grouping_col:str, pipeline:Colum
       
       best_score = model.best_score
       best_iteration = model.best_iteration
+      best_xgboost_rounds = (0, best_iteration + 1)
       
-      train_pred = model.predict(x_train_transformed, iteration_range = (0, best_iteration + 1))
-      test_pred = model.predict(x_test_transformed, iteration_range = (0, best_iteration + 1))
-      
-      precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, train_pred, average='weighted')
-      precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, test_pred, average='weighted')
+      precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, 
+                                                                                   model.predict(x_train_transformed, iteration_range=best_xgboost_rounds), 
+                                                                                   average='weighted')
+    
+      precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, 
+                                                                                model.predict(x_test_transformed, iteration_range=best_xgboost_rounds), 
+                                                                                average='weighted')
+      train_auc = roc_auc_score(y_train, 
+                                model.predict_proba(x_train_transformed, iteration_range=best_xgboost_rounds)[:,1],
+                                average="weighted")
       
       digits = 3
       metrics = OrderedDict()
       metrics["train_precision"]= round(precision_train, digits)
       metrics["train_recall"] =   round(recall_train, digits)
       metrics["train_f1"] =       round(f1_train, digits)
+      metrics["train_auc"] =      round(train_auc, digits)
       metrics["test_precision"] = round(precision_test, digits)
       metrics["test_recall"] =    round(recall_test, digits)
       metrics["test_f1"] =        round(f1_test, digits)
@@ -643,7 +662,7 @@ best_model_stats = features.groupBy('group_name').applyInPandas(train_model_hype
 
 best_model_stats.write.mode('overwrite').format('delta').saveAsTable('default.best_model_stats')
 
-display(spark.table('default.best_model_stats')) 
+display(spark.table('default.best_model_stats'))
 
 # COMMAND ----------
 
@@ -813,8 +832,7 @@ def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols
                                                         random_state=random_state)
     
     # Transforming features outside of the iterative Hyperopt workflow
-    pipeline.fit(x_train)
-    x_train_transformed = pipeline.transform(x_train)
+    x_train_transformed = pipeline.fit_transform(x_train)
     x_test_transformed = pipeline.transform(x_test)
     
     
@@ -834,12 +852,19 @@ def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols
       
       best_score = model.best_score
       best_iteration = model.best_iteration
+      best_xgboost_rounds = (0, best_iteration + 1)
       
-      train_pred = model.predict(x_train_transformed, iteration_range = (0, best_iteration + 1))
-      test_pred = model.predict(x_test_transformed, iteration_range = (0, best_iteration + 1))
+      precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, 
+                                                                                   model.predict(x_train_transformed, iteration_range=best_xgboost_rounds), 
+                                                                                   average='weighted')
     
-      precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, train_pred, average='weighted')
-      precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, test_pred, average='weighted')
+      precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, 
+                                                                                model.predict(x_test_transformed, iteration_range=best_xgboost_rounds), 
+                                                                                average='weighted')
+    
+      train_auc = roc_auc_score(y_train, 
+                                model.predict_proba(x_train_transformed, iteration_range=best_xgboost_rounds)[:,1],
+                                average="weighted")
 
       # Capture and return fit statistcs from the Hyperopt Trial
       digits = 3
@@ -847,6 +872,7 @@ def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols
       metrics["train_precision"]= round(precision_train, digits)
       metrics["train_recall"] =   round(recall_train, digits)
       metrics["train_f1"] =       round(f1_train, digits)
+      metrics["train_auc"] =      round(train_auc, digits)
       metrics["test_precision"] = round(precision_test, digits)
       metrics["test_recall"] =    round(recall_test, digits)
       metrics["test_f1"] =        round(f1_test, digits)
@@ -961,6 +987,7 @@ spark_types = [('group',                StringType()),
                ('train_precision',      FloatType()),
                ('train_recall',         FloatType()),
                ('train_f1',             FloatType()),
+               ('train_auc',            FloatType()),
                ('test_precision',       FloatType()),
                ('test_recall',          FloatType()),
                ('test_f1',              FloatType()),
