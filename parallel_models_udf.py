@@ -28,7 +28,7 @@ from sklearn.datasets import make_classification
 from pyspark import TaskContext
 from pyspark.sql.functions import col
 import pyspark.sql.functions as func
-from pyspark.sql.types import StructType, StructField, StringType, FloatType, IntegerType, ArrayType
+from pyspark.sql.types import StructType, StructField, StringType, FloatType, IntegerType, ArrayType, MapType
 
 from hyperopt import fmin, tpe, hp, Trials, STATUS_OK, SparkTrials
 from hyperopt.early_stop import no_progress_loss
@@ -345,14 +345,14 @@ display(spark.table('default.best_model_stats'))
 
 # COMMAND ----------
 
-parameter_search_space = {'n_estimators':     1000,
-                          'max_depth':        hp.quniform('max_depth', 3, 18, 1),
-                          'lambda':           hp.uniform('lambda', 1, 10),
-                          'subsample':        hp.uniform('subsample', 0.5, 1.0),
-                          'colsample_bytree': hp.uniform('colsample_bytree', 0.5, 1.0),
-                          'eval_metric':      'auc',
+parameter_search_space = {'n_estimators':      1000,
+                          'max_depth':         hp.quniform('max_depth', 3, 18, 1),
+                          'lambda':            hp.uniform('lambda', 1, 10),
+                          'subsample':         hp.uniform('subsample', 0.5, 1.0),
+                          'colsample_bytree':  hp.uniform('colsample_bytree', 0.5, 1.0),
+                          'eval_metric':       'auc',
                           'use_label_encoder': False,
-                          'random_state':     1}
+                          'random_state':      1}
 
 # COMMAND ----------
 
@@ -774,7 +774,7 @@ class GroupInferenceModel(mlflow.pyfunc.PythonModel):
 
 # MAGIC %md ### Adding the custom MLflow model to our PandasUDF and Logging to MLflow  
 # MAGIC 
-# MAGIC Model metrics and parameters are stored in csv files within each group's model artifact directory.
+# MAGIC Model metrics and parameters are stored in csv files within each group's model artifact directory. We also include the best model parameters found by Hyperopt within our output Delta table as a Spark MapType.
 # MAGIC 
 # MAGIC In addition, we leverage Hyperopt's early stopping functionality. Similar to early stopping for XGBoost, we can end our Hyperopt training runs if performance does not improve. Since we want to find our best models efficiently and are now working with larger datasets, we will instruct Hyperopt to stop testing hyper-parameters if our loss functions does not decrease after 25 trials.
 # MAGIC 
@@ -924,14 +924,15 @@ def configure_model_hyperopt_mlflow_udf(label_col:str, grouping_col:str, id_cols
 
       # Construct dataframe output
       output = OrderedDict()
-      output['group'] =           group_name
-      output['mlflow_run_id'] =   run_id
-      output['stage_id'] =        TaskContext().stageId()
-      output['task_attempt_id'] = task_attempt_id = TaskContext().taskAttemptId()
-      output['start_time'] =      start.strftime("%d-%b-%Y (%H:%M:%S.%f)")
-      output['end_time'] =        end.strftime("%d-%b-%Y (%H:%M:%S.%f)")
-      output['elapsed_seconds'] = seconds
+      output['group'] =                group_name
+      output['mlflow_run_id'] =        run_id
+      output['stage_id'] =             TaskContext().stageId()
+      output['task_attempt_id'] =      task_attempt_id = TaskContext().taskAttemptId()
+      output['start_time'] =           start.strftime("%d-%b-%Y (%H:%M:%S.%f)")
+      output['end_time'] =             end.strftime("%d-%b-%Y (%H:%M:%S.%f)")
+      output['elapsed_seconds'] =      seconds
       output['best_hyperopt_trial'] =  trials.best_trial['tid']
+      output['best_params'] =          [final_model_parameters]
 
       # Delete XGBoost best interation (number of trees) from the metrics dict
       del best_model_metrics['best_iteration']
@@ -964,7 +965,8 @@ spark_types = [('group',                StringType()),
                ('test_recall',          FloatType()),
                ('test_f1',              FloatType()),
                ('test_auc',             FloatType()),
-               ('best_hyperopt_trial',  IntegerType())]
+               ('best_hyperopt_trial',  IntegerType()),
+               ('best_params',          MapType(StringType(), FloatType()))]
 
 spark_schema = StructType()
 for col_name, spark_type in spark_types:
