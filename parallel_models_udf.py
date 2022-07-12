@@ -22,7 +22,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import precision_recall_fscore_support
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 from sklearn.datasets import make_classification
 
 from pyspark import TaskContext
@@ -69,42 +69,53 @@ display(df)
 # COMMAND ----------
 
 def create_group_data(group_data: pd.DataFrame) -> pd.DataFrame:
-
-  group_name = group_data["group_name"].loc[0]
+  """
+  Generate a synthetic classification dataset
+  """
   
   n_samples = 10000
   n_features = 20
 
-  X, y = make_classification(n_samples=     n_samples, 
-                             n_features=    n_features, 
-                             n_informative= n_features, 
+  X, y = make_classification(n_samples=      n_samples, 
+                             n_features=     n_features, 
+                             n_informative=  10, 
                              n_redundant=    0, 
                              n_classes=      2, 
                              flip_y=         0.4,
                              random_state=   np.random.randint(1,999))
-
-  # Create missing values to impute
-  observations = n_samples * n_features
-  missing_proportion = 0.1
-  missing_observations = int(missing_proportion * observations)
-
-  X.ravel()[np.random.choice(X.size, missing_observations, replace=False)] = np.nan
-
-  # Create Pandas DataFrame of numeric features
+  
   numeric_feature_names = [f'numeric_feature_{str(n+1).zfill(2)}' for n in range(n_features)]
+  categorical_feature_names = []
+
   df = pd.DataFrame(X, columns=numeric_feature_names)
+  
+  num_categorical_features = 1
+  
+  # Convert numeric column to categorical based on quartiles
+  for numeric_feature_name in numeric_feature_names[:num_categorical_features]:
+  
+    numeric_feature_names.remove(numeric_feature_name)
+
+    categorical_name = numeric_feature_name.replace("numeric", "categorical")
+
+    categorical_feature_names.append(categorical_name)
+
+    df[categorical_name] = pd.qcut(df['numeric_feature_01'],
+                                        q = [0, .25, .5, .75, 1],
+                                       labels=False,
+                                       precision = 0)
+    
+  df = df[categorical_feature_names + numeric_feature_names]
+
+  # Convert a proportion of values to missing
+  percent_missing_values = 0.05
+  mask = np.random.choice([True, False], size=df.shape, p=[percent_missing_values, 1 - percent_missing_values])
+  df = df.mask(mask, other=np.nan)
+
   df['label'] = y
-  df['group_name'] = group_name
+  df['group_name'] = group_data["group_name"].loc[0]
 
-  # Add a categorical column
-  categories = ['A', 'B', 'C']
-  cat_probs_1 = [0.7, 0.2, 0.1]
-  cat_probs_0 = [0.3, 0.5, 0.2]
-
-  df.loc[df['label'] == 1, 'categorical_feature_01'] = np.random.choice(categories, df.loc[df['label'] == 1].shape[0], p=cat_probs_1)
-  df.loc[df['label'] == 0, 'categorical_feature_01'] = np.random.choice(categories, df.loc[df['label'] == 0].shape[0], p=cat_probs_0)
-
-  col_ordering = ['group_name', 'label', 'categorical_feature_01'] + numeric_feature_names
+  col_ordering = ['group_name', 'label'] + categorical_feature_names + numeric_feature_names
 
   return df[col_ordering]
 
@@ -117,9 +128,12 @@ def create_group_data(group_data: pd.DataFrame) -> pd.DataFrame:
 schema = StructType()
 schema.add('group_name', StringType())
 schema.add('label', IntegerType())
-schema.add('categorical_feature_01', StringType())
+schema.add('categorical_feature_01', FloatType())
 
-for column_name in [f'numeric_feature_{str(n+1).zfill(2)}' for n in range(20)]:
+num_categorical_features = 1
+total_features = 20
+
+for column_name in [f'numeric_feature_{str(n+1).zfill(2)}' for n in range(num_categorical_features, total_features)]:
   schema.add(column_name, FloatType())
   
 features = (df.groupby('group_name').applyInPandas(create_group_data, schema=schema)
@@ -129,14 +143,6 @@ features.write.mode('overwrite').format('delta').partitionBy('group_name').saveA
 
 features = spark.table('default.synthetic_group_features')
 display(features)
-
-# COMMAND ----------
-
-# MAGIC %md Each group contains 10,000 records
-
-# COMMAND ----------
-
-display(features.groupBy('group_name').count().orderBy('group_name'))
 
 # COMMAND ----------
 
@@ -161,8 +167,8 @@ def create_preprocessing_transform(categorical_features: List[str], numerical_fe
 
   preprocessing = ColumnTransformer(
         [
-            ("cat", categorical_pipe, categorical_features),
-            ("quantiles", numerical_pipe_quantile, numerical_features)
+            ("categorical", categorical_pipe,        categorical_features),
+            ("numeric",     numerical_pipe_quantile, numerical_features)
         ],
         remainder='drop'
     )
@@ -236,15 +242,18 @@ def configure_model_udf(label_col: str, grouping_col:str, pipeline:ColumnTransfo
     # round. This accounts for the fact that the model retained by xgboost is the last
     # model fit before early stopping rounds were triggered
     precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, 
-                                                                                 model.predict(x_train_transformed, iteration_range=best_xgboost_rounds), 
+                                                                                 model.predict(x_train_transformed, 
+                                                                                               iteration_range=best_xgboost_rounds), 
                                                                                  average='weighted')
     
     precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, 
-                                                                              model.predict(x_test_transformed, iteration_range=best_xgboost_rounds), 
+                                                                              model.predict(x_test_transformed, 
+                                                                                            iteration_range=best_xgboost_rounds), 
                                                                               average='weighted')
     
     train_auc = roc_auc_score(y_train, 
-                              model.predict_proba(x_train_transformed, iteration_range=best_xgboost_rounds)[:,1],
+                              model.predict_proba(x_train_transformed, 
+                                                  iteration_range=best_xgboost_rounds)[:,1],
                               average="weighted")
     
     end = datetime.datetime.now()
@@ -329,7 +338,6 @@ train_model_udf = configure_model_udf(label_col,
 
 best_model_stats = features.groupBy('group_name').applyInPandas(train_model_udf, schema=spark_schema)
 
-spark.sql("DROP TABLE IF EXISTS default.best_model_stats")
 best_model_stats.write.mode('overwrite').format('delta').saveAsTable('default.best_model_stats')
 display(spark.table('default.best_model_stats'))
 
@@ -353,7 +361,7 @@ display(spark.table('default.best_model_stats'))
 
 parameter_search_space = {'n_estimators':      1000,
                           'max_depth':         hp.quniform('max_depth', 3, 18, 1),
-                          'lambda':            hp.uniform('lambda', 1, 10),
+                          'lambda':            hp.uniform('lambda', 1, 15),
                           'subsample':         hp.uniform('subsample', 0.5, 1.0),
                           'colsample_bytree':  hp.uniform('colsample_bytree', 0.5, 1.0),
                           'eval_metric':       'auc',
@@ -394,15 +402,18 @@ def configure_object_fn(x_train_transformed, y_train, x_test_transformed, y_test
     best_xgboost_rounds = (0, best_iteration + 1)
     
     precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, 
-                                                                                 model.predict(x_train_transformed, iteration_range=best_xgboost_rounds), 
+                                                                                 model.predict(x_train_transformed, 
+                                                                                               iteration_range=best_xgboost_rounds), 
                                                                                  average='weighted')
     
     precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, 
-                                                                              model.predict(x_test_transformed, iteration_range=best_xgboost_rounds), 
+                                                                              model.predict(x_test_transformed, 
+                                                                                            iteration_range=best_xgboost_rounds), 
                                                                               average='weighted')
     
     train_auc = roc_auc_score(y_train, 
-                              model.predict_proba(x_train_transformed, iteration_range=best_xgboost_rounds)[:,1],
+                              model.predict_proba(x_train_transformed, 
+                                                  iteration_range=best_xgboost_rounds)[:,1],
                               average="weighted")
 
     digits = 3
@@ -464,13 +475,15 @@ best_params = fmin(fn=objective_fn,
 
 # COMMAND ----------
 
-print("Best model parameters")
-best_params
+print("Best model parameters \n")
+for param, value in best_params.items():
+  print(param, value)
 
 # COMMAND ----------
 
-print("Best model statistics")
-trials.best_trial['result']['metrics']
+print("Best model statistics \n")
+for metric, value in trials.best_trial['result']['metrics'].items():
+  print(metric, value)
 
 # COMMAND ----------
 
@@ -508,10 +521,6 @@ model_pipeline = Pipeline([("preprocess", pipeline), ("classifier", model)])
 
 # fit pre-processor and model
 model_pipeline.fit(features_df, features_df['label'])
-
-# COMMAND ----------
-
-final_model_parameters
 
 # COMMAND ----------
 
@@ -576,14 +585,17 @@ def configure_model_hyperopt_udf(label_col:str, grouping_col:str, pipeline:Colum
       best_xgboost_rounds = (0, best_iteration + 1)
       
       precision_train, recall_train, f1_train, _ = precision_recall_fscore_support(y_train, 
-                                                                                   model.predict(x_train_transformed, iteration_range=best_xgboost_rounds), 
+                                                                                   model.predict(x_train_transformed, 
+                                                                                                 iteration_range=best_xgboost_rounds), 
                                                                                    average='weighted')
     
       precision_test, recall_test, f1_test, _ = precision_recall_fscore_support(y_test, 
-                                                                                model.predict(x_test_transformed, iteration_range=best_xgboost_rounds), 
+                                                                                model.predict(x_test_transformed, 
+                                                                                              iteration_range=best_xgboost_rounds), 
                                                                                 average='weighted')
       train_auc = roc_auc_score(y_train, 
-                                model.predict_proba(x_train_transformed, iteration_range=best_xgboost_rounds)[:,1],
+                                model.predict_proba(x_train_transformed, 
+                                                    iteration_range=best_xgboost_rounds)[:,1],
                                 average="weighted")
       
       digits = 3
@@ -742,7 +754,7 @@ logged_model = f'runs:/{run_id}/my_model'
 loaded_model = mlflow.pyfunc.spark_udf(spark, model_uri=logged_model, result_type='double')
 
 # Apply the model to a Spark Dataframe
-my_predictions = features.select('numeric_feature_01').withColumn('numeric_feature_01_scaled', loaded_model('numeric_feature_01'))
+my_predictions = features.select('numeric_feature_02').withColumn('numeric_feature_02_scaled', loaded_model('numeric_feature_02'))
 
 display(my_predictions)
 
@@ -1016,7 +1028,6 @@ train_model_hyperopt_mlflow_udf = configure_model_hyperopt_mlflow_udf(label_col,
 # Fit models by applying UDF  
 best_model_stats = features.groupBy('group_name').applyInPandas(train_model_hyperopt_mlflow_udf, schema=spark_schema)
 
-spark.sql("DROP TABLE IF EXISTS default.best_model_stats")
 best_model_stats.write.mode('overwrite').format('delta').saveAsTable('default.best_model_stats')
 display(spark.table('default.best_model_stats'))
 
